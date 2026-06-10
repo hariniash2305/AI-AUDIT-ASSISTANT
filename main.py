@@ -1,7 +1,22 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.get("/")
 def home():
-    return {"message": "AI Audit Assistant Backend Running"}
+    return "Home"
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    return {"message": "File uploaded successfully"}
