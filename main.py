@@ -1,14 +1,16 @@
 from fastapi import FastAPI, UploadFile, File
-import pdfplumber
-import os
 from fastapi.middleware.cors import CORSMiddleware
+import pdfplumber
+import shutil
+import os
 import re
 
 app = FastAPI()
 
+# Allow React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -17,17 +19,149 @@ app.add_middleware(
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+
 @app.get("/")
 def home():
-    return {"message": "AI Audit API Running"}
+    return {"message": "AI Audit Assistant Running"}
 
+
+# ----------------------------
+# Helper Function
+# ----------------------------
+def extract_pattern(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            return match.group(1).strip()
+
+    return None
+
+
+# ----------------------------
+# Invoice Extraction
+# ----------------------------
+def extract_invoice_data(text):
+    return {
+        "invoice_number": extract_pattern(
+            text,
+            [
+                r"Invoice\s*Number[:\s]*([A-Z0-9\-]+)",
+                r"Invoice\s*No\.?[:\s]*([A-Z0-9\-]+)",
+                r"Invoice\s*#[:\s]*([A-Z0-9\-]+)"
+            ]
+        ),
+
+        "vendor": extract_pattern(
+            text,
+            [
+                r"Vendor[:\s]*(.+)",
+                r"Supplier[:\s]*(.+)"
+            ]
+        ),
+
+        "amount": extract_pattern(
+            text,
+            [
+                r"Total\s*Amount[:\s₹]*([\d,\.]+)",
+                r"Amount[:\s₹]*([\d,\.]+)"
+            ]
+        ),
+
+        "date": extract_pattern(
+            text,
+            [
+                r"Date[:\s]*(\d{2}/\d{2}/\d{4})",
+                r"Date[:\s]*(\d{2}-\d{2}-\d{4})"
+            ]
+        ),
+
+        "gst_number": extract_pattern(
+            text,
+            [
+                r"GST(?:IN)?[:\s]*([A-Z0-9]+)"
+            ]
+        ),
+
+        "po_number": extract_pattern(
+            text,
+            [
+                r"PO\s*Number[:\s]*([A-Z0-9\-]+)",
+                r"PO\s*No\.?[:\s]*([A-Z0-9\-]+)"
+            ]
+        ),
+
+        "tax": extract_pattern(
+            text,
+            [
+                r"Tax[:\s₹]*([\d,\.]+)"
+            ]
+        )
+    }
+
+
+# ----------------------------
+# Purchase Order Extraction
+# ----------------------------
+def extract_po_data(text):
+    return {
+        "po_number": extract_pattern(
+            text,
+            [
+                r"PO\s*Number[:\s]*([A-Z0-9\-]+)",
+                r"Purchase\s*Order\s*No\.?[:\s]*([A-Z0-9\-]+)"
+            ]
+        ),
+
+        "vendor": extract_pattern(
+            text,
+            [
+                r"Vendor[:\s]*(.+)",
+                r"Supplier[:\s]*(.+)"
+            ]
+        ),
+
+        "amount": extract_pattern(
+            text,
+            [
+                r"Approved\s*Amount[:\s₹]*([\d,\.]+)",
+                r"Amount[:\s₹]*([\d,\.]+)"
+            ]
+        ),
+
+        "date": extract_pattern(
+            text,
+            [
+                r"Date[:\s]*(\d{2}/\d{2}/\d{4})",
+                r"Date[:\s]*(\d{2}-\d{2}-\d{4})"
+            ]
+        )
+    }
+
+
+# ----------------------------
+# Detect Document Type
+# ----------------------------
+def detect_document_type(text):
+
+    text_lower = text.lower()
+
+    if "purchase order" in text_lower:
+        return "purchase_order"
+
+    return "invoice"
+
+
+# ----------------------------
+# Upload Endpoint
+# ----------------------------
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...)):
 
     file_path = os.path.join(UPLOAD_FOLDER, file.filename)
 
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
     text = ""
 
@@ -38,19 +172,15 @@ async def upload_pdf(file: UploadFile = File(...)):
             if page_text:
                 text += page_text + "\n"
 
-    invoice_match = re.search(r"Invoice Number:\s*(.+)", text)
-    vendor_match = re.search(r"Vendor:\s*(.+)", text)
-    amount_match = re.search(r"Amount:\s*[₹Rs.\s]*([\d,]+)", text)
-    date_match = re.search(r"Date:\s*(\d{2}/\d{2}/\d{4})", text)
+    document_type = detect_document_type(text)
 
-    invoice = invoice_match.group(1).strip() if invoice_match else None
-    vendor = vendor_match.group(1).strip() if vendor_match else None
-    amount = amount_match.group(1).replace(",", "") if amount_match else None
-    date = date_match.group(1) if date_match else None
+    if document_type == "purchase_order":
+        extracted_data = extract_po_data(text)
+    else:
+        extracted_data = extract_invoice_data(text)
 
     return {
-        "invoice": invoice,
-        "vendor": vendor,
-        "amount": amount,
-        "date": date
+        "filename": file.filename,
+        "document_type": document_type,
+        "data": extracted_data
     }
