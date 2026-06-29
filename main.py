@@ -5,6 +5,8 @@ import shutil
 import os
 import re
 import traceback
+import uuid
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal, Base
@@ -34,95 +36,184 @@ app.add_middleware(
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-@app.get("/")
-def home():
-    return {"message": "AI Audit Assistant Running"}
 
 # ====================== HELPERS ======================
+def safe_float(value):
+    if not value:
+        return None
+    try:
+        cleaned = str(value).replace(",", "").replace("₹", "").replace(" ", "").strip()
+        return float(cleaned) if cleaned else None
+    except (ValueError, TypeError):
+        return None
+
+
 def extract_pattern(text, patterns):
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).strip()
     return None
 
+
 def detect_document_type(text: str):
     lower = text.lower()
-    
-    invoice_keywords = ["invoice", "bill no", "tax invoice", "gst invoice", "invoice number"]
-    po_keywords = ["purchase order", "purchaseorder", "po number", "approved po"]
-    
-    if any(kw in lower for kw in invoice_keywords):
-        return "invoice"
-    if any(kw in lower for kw in po_keywords):
-        return "purchase_order"
-    
-    return "invoice"  # default
 
+    # Invoice keywords
+    if any(word in lower for word in [
+        "tax invoice",
+        "invoice number",
+        "invoice no",
+        "invoice"
+    ]):
+        return "invoice"
+
+    # Purchase Order keywords
+    if any(word in lower for word in [
+        "purchase order",
+        "purchase order number",
+        "purchase order no"
+    ]):
+        return "purchase_order"
+
+    return "invoice"  # default to invoice
+
+
+# ====================== IMPROVED EXTRACTION ======================
 def extract_invoice_data(text):
-    return {
-        "invoice_number": extract_pattern(text, [r"Invoice\s*Number[:\s]*([A-Z0-9\-]+)", r"Invoice\s*No\.?[:\s]*([A-Z0-9\-]+)", r"Bill\s*No\.?[:\s]*([A-Z0-9\-]+)"]),
-        "vendor": extract_pattern(text, [r"Vendor[:\s]*(.+?)(?=\s*(?:GST|PO|Date|Total|$))", r"Supplier[:\s]*(.+?)(?=\s*(?:GST|PO|Date|$))", r"From[:\s]*(.+?)(?=\s*(?:GST|PO|$))"]),
-        "amount": extract_pattern(text, [r"Total\s*Amount[:\s₹]*([\d,\.]+)", r"Grand\s*Total[:\s₹]*([\d,\.]+)", r"Amount[:\s₹]*([\d,\.]+)", r"₹\s*([\d,\.]+)"]),
+    # Special handling for Vendor
+    vendor = extract_pattern(text, [
+        r"Vendor\s*:?\s*([^\n\r]+)",
+        r"Supplier\s*:?\s*([^\n\r]+)",
+        r"From\s*:?\s*([^\n\r]+)"
+    ])
+    if vendor:
+        vendor = re.sub(r"\s+", " ", vendor).strip()
+
+    data = {
+        "invoice_number": extract_pattern(text, [
+            r"Invoice\s*Number[:\s]*([A-Z0-9\-]+)",
+            r"Invoice\s*No\.?[:\s]*([A-Z0-9\-]+)",
+            r"Bill\s*No\.?[:\s]*([A-Z0-9\-]+)",
+            r"Invoice[:\s]*([A-Z0-9\-]+)"
+        ]),
+        "vendor": vendor,
+        "amount": extract_pattern(text, [
+            r"Grand\s*Total[:\s₹]*([\d,\.]+)",
+            r"Total\s*Amount[:\s₹]*([\d,\.]+)",
+            r"Amount[:\s₹]*([\d,\.]+)",
+            r"₹\s*([\d,\.]+)"
+        ]),
         "date": extract_pattern(text, [r"Date[:\s]*(\d{2}[/-]\d{2}[/-]\d{4})"]),
         "gst_number": extract_pattern(text, [r"GST(?:IN)?[:\s]*([A-Z0-9]+)"]),
-        "po_number": extract_pattern(text, [r"PO\s*Number[:\s]*([A-Z0-9\-]+)", r"PO\s*No\.?[:\s]*([A-Z0-9\-]+)"]),
+        "po_number": extract_pattern(text, [
+            r"PO\s*Number[:\s]*([A-Z0-9\-]+)",
+            r"PO\s*No\.?[:\s]*([A-Z0-9\-]+)"
+        ]),
     }
+    print("Extracted Invoice Data:", data)   # Debug
+    return data
+
 
 def extract_po_data(text):
-    return {
-        "po_number": extract_pattern(text, [r"PO\s*Number[:\s]*([A-Z0-9\-]+)", r"Purchase\s*Order\s*No\.?[:\s]*([A-Z0-9\-]+)"]),
-        "vendor": extract_pattern(text, [r"Vendor[:\s]*(.+?)(?=\s*(?:Date|Amount|$))", r"Supplier[:\s]*(.+?)(?=\s*(?:Date|Amount|$))"]),
-        "amount": extract_pattern(text, [r"Amount[:\s₹]*([\d,\.]+)", r"Approved\s*Amount[:\s₹]*([\d,\.]+)", r"Total[:\s₹]*([\d,\.]+)"]),
+    # Special handling for Vendor
+    vendor = extract_pattern(text, [
+        r"Vendor\s*:?\s*([^\n\r]+)",
+        r"Supplier\s*:?\s*([^\n\r]+)"
+    ])
+    if vendor:
+        vendor = re.sub(r"\s+", " ", vendor).strip()
+
+    data = {
+        "po_number": extract_pattern(text, [
+            r"PO\s*Number[:\s]*([A-Z0-9\-]+)",
+            r"Purchase\s*Order\s*No\.?[:\s]*([A-Z0-9\-]+)",
+            r"PO[:\s]*([A-Z0-9\-]+)"
+        ]),
+        "vendor": vendor,
+        "amount": extract_pattern(text, [
+            r"Total[:\s₹]*([\d,\.]+)",
+            r"Grand\s*Total[:\s₹]*([\d,\.]+)",
+            r"Amount[:\s₹]*([\d,\.]+)"
+        ]),
         "date": extract_pattern(text, [r"Date[:\s]*(\d{2}[/-]\d{2}[/-]\d{4})"])
     }
+    print("Extracted PO Data:", data)
+    return data
 
-# ====================== AUDIT RULE #1 ======================
+
+# ====================== AUDIT RULES ======================
 def run_amount_verification(db: Session, invoice: Invoice):
-    print(f"\n[AUDIT] Checking Invoice: {invoice.invoice_number} | Amount: {invoice.amount} | PO#: {invoice.po_number} | Vendor: {invoice.vendor}")
-
     if not invoice.amount:
-        print("[AUDIT] No amount found in invoice")
         return None
 
     po = None
-    # Match by PO Number
     if invoice.po_number:
-        po = db.query(PurchaseOrder).filter(PurchaseOrder.po_number.ilike(f"%{invoice.po_number}%")).first()
+        po = db.query(PurchaseOrder).filter(
+            PurchaseOrder.po_number.ilike(f"%{invoice.po_number}%")
+        ).first()
 
-    # Fallback: Match by Vendor
     if not po and invoice.vendor:
-        po = db.query(PurchaseOrder).filter(PurchaseOrder.vendor.ilike(f"%{invoice.vendor}%")).first()
+        po = db.query(PurchaseOrder).filter(
+            PurchaseOrder.vendor.ilike(f"%{invoice.vendor}%")
+        ).first()
 
-    if po and po.amount:
-        print(f"[AUDIT] Matched PO: {po.po_number} | PO Amount: {po.amount}")
-        if invoice.amount > po.amount:
-            difference = invoice.amount - po.amount
+    if po and po.amount and invoice.amount > po.amount:
+        difference = invoice.amount - po.amount
+        finding = AuditFinding(
+            invoice_id=invoice.id,
+            po_id=po.id,
+            rule_name="Amount Verification",
+            risk_level="HIGH",
+            description=f"Invoice amount (₹{invoice.amount}) exceeds PO amount (₹{po.amount})",
+            difference=difference
+        )
+        db.add(finding)
+        db.commit()
+        db.refresh(finding)
+        return finding
+    return None
+
+
+def run_missing_field_detection(db: Session, invoice: Invoice):
+    findings = []
+    required = {
+        "Invoice Number": invoice.invoice_number,
+        "Vendor Name": invoice.vendor,
+        "Amount": invoice.amount,
+        "Date": invoice.date,
+        "GST Number": invoice.gst_number
+    }
+
+    for field, value in required.items():
+        if not value or str(value).strip() == "":
             finding = AuditFinding(
                 invoice_id=invoice.id,
-                po_id=po.id,
-                rule_name="Amount Verification",
-                risk_level="HIGH",
-                description=f"Invoice amount (₹{invoice.amount}) exceeds PO amount (₹{po.amount})",
-                difference=difference
+                rule_name="Missing Information Detection",
+                risk_level="MEDIUM",
+                description=f"Mandatory field missing: {field}"
             )
             db.add(finding)
-            db.commit()
-            db.refresh(finding)
-            print(f"[AUDIT] ✅ HIGH RISK Finding Created! Difference: ₹{difference}")
-            return finding
-        else:
-            print("[AUDIT] Amount is within PO limit")
-    else:
-        print("[AUDIT] No matching PO found")
+            findings.append(finding)
 
-    return None
+    if findings:
+        db.commit()
+        for f in findings:
+            db.refresh(f)
+    return findings
+
 
 # ====================== UPLOAD ENDPOINT ======================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    file_path = None
     try:
-        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(400, "Only PDF files are allowed")
+
+        file_ext = Path(file.filename).suffix
+        safe_filename = f"{uuid.uuid4()}{file_ext}"
+        file_path = os.path.join(UPLOAD_FOLDER, safe_filename)
 
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -138,25 +229,27 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db
             raise HTTPException(400, "Could not extract text from PDF")
 
         document_type = detect_document_type(text)
+        data = None
+        amount_result = None
+        missing_results = []
 
         if document_type == "purchase_order":
             data = extract_po_data(text)
             po = PurchaseOrder(
                 po_number=data.get("po_number"),
                 vendor=data.get("vendor"),
-                amount=float(str(data.get("amount", "")).replace(",", "").replace("₹", "")) or None,
+                amount=safe_float(data.get("amount")),
                 date=data.get("date")
             )
             db.add(po)
             db.commit()
             db.refresh(po)
-            audit_result = None
         else:
             data = extract_invoice_data(text)
             invoice = Invoice(
                 invoice_number=data.get("invoice_number"),
                 vendor=data.get("vendor"),
-                amount=float(str(data.get("amount", "")).replace(",", "").replace("₹", "")) or None,
+                amount=safe_float(data.get("amount")),
                 date=data.get("date"),
                 gst_number=data.get("gst_number"),
                 po_number=data.get("po_number")
@@ -165,29 +258,113 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db
             db.commit()
             db.refresh(invoice)
 
-            audit_result = run_amount_verification(db, invoice)
+            amount_result = run_amount_verification(db, invoice)
+            missing_results = run_missing_field_detection(db, invoice)
 
         return {
+            "success": True,
             "filename": file.filename,
             "document_type": document_type,
             "extracted_data": data,
-            "audit_finding": {
-                "risk_level": audit_result.risk_level,
-                "description": audit_result.description,
-                "difference": audit_result.difference
-            } if audit_result else None,
+            "audit_findings": (
+                ([{
+                    "risk_level": amount_result.risk_level,
+                    "description": amount_result.description,
+                    "difference": amount_result.difference
+                }] if amount_result else [])
+                + [{
+                    "risk_level": f.risk_level,
+                    "description": f.description,
+                    "difference": f.difference
+                } for f in missing_results]
+            ),
             "message": "Processed successfully"
         }
 
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         print(traceback.format_exc())
-        raise HTTPException(500, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Internal Server Error"
+        )
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"Failed to delete file {file_path}: {e}")
 
-# ====================== VIEW DATA ======================
+
+# ====================== DASHBOARD APIs ======================
+@app.get("/api/stats")
+def get_stats(db: Session = Depends(get_db)):
+    total_docs = db.query(Invoice).count() + db.query(PurchaseOrder).count()
+    total_findings = db.query(AuditFinding).count()
+    high_risk = db.query(AuditFinding).filter(AuditFinding.risk_level == "HIGH").count()
+    medium_risk = db.query(AuditFinding).filter(AuditFinding.risk_level == "MEDIUM").count()
+
+    return {
+        "documents_processed": total_docs,
+        "total_findings": total_findings,
+        "high_risk": high_risk,
+        "medium_risk": medium_risk
+    }
+
+
+@app.get("/api/findings")
+def get_findings(db: Session = Depends(get_db)):
+    findings = db.query(AuditFinding).order_by(AuditFinding.id.desc()).all()
+    return [
+        {
+            "id": f.id,
+            "rule_name": f.rule_name,
+            "description": f.description,
+            "risk_level": f.risk_level,
+            "difference": f.difference,
+            "created_at": f.created_at.isoformat() if hasattr(f, 'created_at') and f.created_at else None
+        }
+        for f in findings
+    ]
+
+
 @app.get("/data")
 def get_all_data(db: Session = Depends(get_db)):
     return {
-        "invoices": db.query(Invoice).all(),
-        "purchase_orders": db.query(PurchaseOrder).all(),
-        "audit_findings": db.query(AuditFinding).all()
+        "invoices": [
+            {
+                "id": i.id,
+                "invoice_number": i.invoice_number,
+                "vendor": i.vendor,
+                "amount": i.amount,
+                "date": i.date,
+                "gst_number": i.gst_number,
+                "po_number": i.po_number
+            }
+            for i in db.query(Invoice).all()
+        ],
+        "purchase_orders": [
+            {
+                "id": p.id,
+                "po_number": p.po_number,
+                "vendor": p.vendor,
+                "amount": p.amount,
+                "date": p.date
+            }
+            for p in db.query(PurchaseOrder).all()
+        ],
+        "audit_findings": [
+            {
+                "id": f.id,
+                "invoice_id": f.invoice_id,
+                "po_id": f.po_id,
+                "rule_name": f.rule_name,
+                "risk_level": f.risk_level,
+                "description": f.description,
+                "difference": f.difference,
+                "created_at": f.created_at.isoformat() if hasattr(f, 'created_at') and f.created_at else None
+            }
+            for f in db.query(AuditFinding).all()
+        ]
     }
